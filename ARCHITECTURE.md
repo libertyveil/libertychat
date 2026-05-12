@@ -11,9 +11,8 @@ This document describes the high-level system architecture. Detailed specificati
 │  Client SDK (Rust core, FFI bindings to Swift/Kotlin) │
 ├─────────────────────────────────────────────────────┤
 │  Protocol layer                                     │
-│    - Identity (DID-style keypairs)                  │
-│    - Sessions (Double Ratchet derived)              │
-│    - Groups (MLS / RFC 9420)                        │
+│    - Identity (DID-style keypairs, device certs)    │
+│    - Conversations (MLS for all, 1:1 and groups)    │
 │    - Realtime (WebRTC + DTLS-SRTP)                  │
 │    - Mail (long-form persistent messages)           │
 ├─────────────────────────────────────────────────────┤
@@ -42,6 +41,8 @@ See [`design/01-identity.md`](design/01-identity.md).
 ### Mailbox server
 
 Asynchronous messages are stored on **mailbox servers**: dumb relays that hold encrypted blobs in queues. Each conversation uses dedicated, randomly-named queues. The server cannot read content (encrypted) and cannot link queues (no global identifier).
+
+**One queue per conversation, multiple recipient devices subscribe.** The sender uploads each message once; the server fans the encrypted blob out to all subscribing devices of the recipient. This makes multi-device a first-class feature without multiplying sender bandwidth or server storage.
 
 Mailbox servers are trivially self-hostable: a single Rust binary, no database server (sled or RocksDB embedded). One server can serve thousands of users.
 

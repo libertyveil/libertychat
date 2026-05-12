@@ -14,9 +14,9 @@ LibertyChat takes the **mailbox-queue model** from SimpleX as its core. Per-cont
 - Multi-server distribution per user
 
 ### What we change
-- **Crypto**: Replace SimpleX's custom protocol composition with standardized MLS (RFC 9420) for groups. SimpleX uses a Sesame-like extension that does not scale efficiently beyond ~50 group members.
+- **Crypto**: Replace SimpleX's custom protocol composition with standardized MLS (RFC 9420) for **all** conversations, including 1:1. SimpleX uses Double Ratchet for 1:1 and a Sesame-like extension for groups that does not scale beyond ~50 members.
 - **Post-Quantum**: Hybrid Kyber + X25519 from day one. SimpleX is adding PQ but as a later evolution.
-- **Multi-device**: First-class multi-device support via per-device sub-keys signed by master identity. SimpleX has a master-slave model with significant friction.
+- **Multi-device**: First-class multi-device with single-upload, server-fanout to all subscribed devices. Each device is an MLS member; sender encrypts once and uploads once, mailbox server delivers to all of recipient's devices in parallel. SimpleX has a master-slave model where only the primary device receives messages live.
 - **Mail layer**: Add a persistent long-form mail channel as a first-class feature. SimpleX has no comparable concept; messages are ephemeral chat-style.
 - **Identity discovery**: Optional DNS-based discovery (`@user@domain`) so users with their own domain can be found without a centralized name service. SimpleX has no global discovery (privacy preserving but inconvenient).
 - **Implementation language**: Rust instead of Haskell. Easier mobile FFI, smaller binaries, larger contributor pool, deterministic memory.

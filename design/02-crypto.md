@@ -38,26 +38,35 @@
 
 ## Protocol layers
 
-### One-to-one messaging: Double Ratchet
+### Unified messaging: MLS for everything
 
-Same as Signal Protocol, with hybrid PQ key exchange (PQXDH-style) replacing classical X3DH.
+LibertyChat uses **MLS (RFC 9420) for all conversations**, including 1:1 chats. A 1:1 conversation is modeled as a small MLS group whose members are all participating devices of both users.
 
-- Initial handshake derives a shared root key from both parties' identity and ephemeral keys
-- Per-message keys derived via Double Ratchet (symmetric ratchet + DH ratchet)
-- Forward Secrecy: each message encrypted with a unique key, deleted after use
-- Post-Compromise Security: DH ratchet recovers from key compromise after the next exchange
+Rationale:
+- One protocol to implement, test, and audit instead of two (Double Ratchet for 1:1 + MLS for groups)
+- Single-upload, server-fanout works uniformly regardless of whether the conversation has 2 or 200 members
+- Multi-device for both sides is built into the membership model
+- Standardized (IETF) and formally analyzed
 
-### Group messaging: MLS (RFC 9420)
-
-Standardized group key agreement protocol. Properties:
+Properties:
 
 - **Logarithmic message overhead** for adding/removing members in groups of any size
-- **Continuous key rotation** as members join and leave
-- **Forward Secrecy** for past messages
+- **Continuous key rotation** as members or devices join and leave
+- **Forward Secrecy** for past messages (old epoch keys deleted)
 - **Post-Compromise Security** after the next epoch
 - **Authentication** of all group operations
+- **Hybrid PQ readiness** through MLS's "extensible ciphersuites" mechanism — the active ciphersuite includes X25519+Kyber for KEM, Ed25519+Dilithium for signatures
 
-We use the Rust `mls-rs` library (AWS open source implementation, formally analyzed).
+Implementation: Rust `mls-rs` library (AWS open source, audited).
+
+### Conversation bootstrap
+
+Connecting to a new contact:
+1. Sender's invitation link includes the sender's device-group anchor (master public key) and an X25519+Kyber bundle
+2. Recipient generates response bundle, performs initial key agreement
+3. Both sides construct an MLS group containing all their devices as members
+4. MLS Welcome messages are delivered to all devices of both sides via the mailbox layer
+5. From this point, MLS handles all message encryption
 
 ### Mailbox queue auth
 

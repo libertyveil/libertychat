@@ -29,18 +29,47 @@ Each physical device (phone, laptop, tablet) generates its own **device keypair*
 
 When a contact receives a message from a device, they verify the device certificate against the known master identity. If valid, the device is trusted as belonging to that user.
 
-Adding a new device:
+### Device group model
+
+A user's set of devices is modeled as an MLS group internally:
+
+- The "user's device group" contains all of the user's active devices as members
+- The master identity is the group's anchor (signs all member additions/removals)
+- Each conversation (1:1 or group) is itself an MLS group whose members are all the participating users' devices
+
+This means a 1:1 conversation between Alice (3 devices) and Bob (2 devices) is technically an MLS group with **5 members**. When Bob sends a message:
+- Encrypted once with the conversation's MLS epoch key
+- Delivered to Alice's incoming mailbox queue (a single upload)
+- All of Alice's subscribed devices receive the same ciphertext
+- Each device decrypts independently using its own MLS state
+
+### Multi-device message reception
+
+All of a user's devices **subscribe to the same incoming mailbox queue** for a given conversation. The mailbox server fanout means one upload reaches all devices.
+
+This is fundamentally different from SimpleX's master-slave model:
+- **SimpleX**: one "master" device holds the queue subscription; "linked" devices are remote views that only work when the master is online
+- **LibertyChat**: every device is an equal first-class subscriber; any device works independently, even if others are offline
+
+### Adding a new device
+
 1. New device generates device keypair.
 2. User authenticates from existing trusted device (QR scan or short-code).
-3. Existing device signs a device certificate for the new device.
-4. New device stores the signed certificate and announces itself to existing contacts.
+3. Existing device:
+   - Signs a device certificate for the new device
+   - Adds the new device as a member to every active conversation's MLS group via standard MLS `Add` proposals
+   - The MLS commit triggers an epoch transition
+4. New device receives Welcome messages with current group state for each conversation
+5. From this point on, the new device participates equally in all conversations
 
-Removing a device:
-1. User issues a **revocation certificate** for the device.
-2. Revocation is broadcast to all contacts via the existing message channels.
-3. Subsequent messages from that device are rejected by recipients.
+### Removing a device
 
-This solves SimpleX's multi-device pain: any device can act independently, but all are bound to one identity.
+1. User issues an MLS `Remove` proposal for the device, on every conversation it's a member of
+2. Commits trigger epoch transitions; new epoch keys exclude the removed device
+3. Revoked device's certificate is published to contacts so it's no longer trusted for new messages
+4. Old messages decrypted with prior epoch keys remain accessible on the removed device until the local DB is wiped (server can't enforce wipe)
+
+This solves SimpleX's multi-device pain: any device can act independently, all are bound to one identity, key compromise affects only one device.
 
 ## Recovery
 

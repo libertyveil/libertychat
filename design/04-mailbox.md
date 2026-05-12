@@ -15,10 +15,54 @@ A **queue** is an anonymous, unidirectional message buffer hosted on a mailbox s
 
 A conversation between Alice and Bob requires **two queues** (one per direction):
 
-- Queue A→B: Bob's incoming. Alice writes; Bob reads.
-- Queue B→A: Alice's incoming. Bob writes; Alice reads.
+- Queue A→B: Bob's incoming. Alice writes; **all of Bob's devices read.**
+- Queue B→A: Alice's incoming. Bob writes; **all of Alice's devices read.**
 
 Each queue can live on a different mailbox server, chosen by the recipient. Splits metadata across multiple servers — none can see the full picture of a user's social graph.
+
+### Multi-device fanout
+
+A user may have multiple devices (phone, laptop, tablet). All of those devices **subscribe to the same incoming queue**.
+
+When the sender writes a message:
+1. Encrypts the message **once** for the entire recipient (all devices) — see encryption details below
+2. Uploads the encrypted blob **once** to the queue
+3. Mailbox server stores the blob and notifies all subscribed devices
+4. Each subscribing device pulls (or is pushed) the blob
+5. Each device decrypts independently using its own key material
+
+The sender does **not** encrypt N times for N recipient devices. One encryption, one upload, server-side fanout to subscribers.
+
+This means:
+- Sender bandwidth is O(message size), not O(message size × recipient devices)
+- Storage on the mailbox server is O(message size), not O(× recipient devices)
+- Receiver-side decryption is O(1) per device
+
+### Multi-device key distribution
+
+Each user's set of devices is treated as a **group** in MLS terms (RFC 9420):
+
+- Alice has her own "device group" containing Phone, Laptop, Tablet
+- Bob has his own "device group" containing his devices
+- A 1:1 conversation between Alice and Bob is an MLS group whose members are **all of Alice's devices + all of Bob's devices**
+- A group conversation is the same, just with more users contributing more devices
+
+When the sender encrypts a message:
+- The message is encrypted with the current MLS group's epoch key
+- Every device in the group (including sender's other devices) can decrypt
+- One ciphertext per message, regardless of total device count
+
+Adding a device:
+- User's new device generates its keypair and is signed by master identity
+- Existing trusted device adds the new device to all relevant MLS groups via standard MLS Add proposals
+- MLS handles epoch transition; the new device receives a Welcome with current group state
+
+Removing a device:
+- Existing device issues MLS Remove proposal + revocation certificate for the device
+- New epoch derived; removed device's keys no longer valid
+- All other devices continue uninterrupted
+
+This is conceptually similar to how Matrix's Megolm rooms work, but standardized via MLS and applied to 1:1 conversations as well as groups.
 
 ## Operations
 
@@ -28,13 +72,25 @@ The protocol exposes a small set of server operations:
 |---|---|---|
 | `CREATE` | recipient | Allocate new queue with given keys |
 | `WRITE` | sender | Append encrypted blob to queue |
-| `READ` | recipient | Fetch blobs from queue |
-| `ACK` | recipient | Confirm receipt; server may delete |
+| `READ` | recipient device | Fetch blobs from queue |
+| `ACK` | recipient device | Confirm receipt by this device |
 | `DELETE` | recipient | Remove queue entirely |
 | `STATUS` | recipient | Get queue size, last activity |
-| `SUBSCRIBE` | recipient | Long-poll or push notifications for new arrivals |
+| `SUBSCRIBE` | recipient device | Long-poll or push notifications for new arrivals |
 
 Each operation is signed by the appropriate key. The server verifies the signature against the keys stored at queue creation time.
+
+### Per-device subscription and ACK
+
+Multiple devices of the same recipient can simultaneously subscribe and read from the queue. The server tracks acknowledgement **per subscribed device**:
+
+- Each device sends its own `ACK` after successfully processing a message
+- The server retains the blob until **all** subscribed devices have acknowledged
+- Only then is the blob eligible for deletion
+
+This guarantees that a message survives until every recipient device has had a chance to fetch it, while still bounded storage (expiry policy applies).
+
+Device subscriptions are authenticated via the recipient sign key (which all devices possess via secure sharing) plus a per-device sub-key signed by the master identity. This way, the server can authorize multiple devices without exposing which is "primary".
 
 ## Queue creation flow
 
@@ -52,7 +108,9 @@ Each operation is signed by the appropriate key. The server verifies the signatu
 5. Recipient shares the invitation URL out-of-band with the sender.
 6. Sender's client parses the URL, generates its own DH keypair, and writes the first message containing its DH public key + initial encrypted payload.
 
-Once both parties have exchanged DH public keys via the queue, they derive a shared secret (Diffie-Hellman) and bootstrap a Double Ratchet session. From then on, all message contents are encrypted with the ratchet, not just queue-layer crypto.
+Once both parties have exchanged initial key material via the queue, they bootstrap an **MLS group** (with all of both parties' devices as members). All subsequent message contents are encrypted with the MLS group's epoch keys, not with raw Diffie-Hellman shared secrets.
+
+The mailbox-layer crypto (queue handshake) protects against the server learning queue membership; the MLS-layer crypto protects message content end-to-end across all participating devices.
 
 ## Encryption layers
 
@@ -62,15 +120,19 @@ A message in transit has three encryption layers:
 ┌──────────────────────────────────────┐
 │ TLS 1.3 / QUIC (transport)           │  ← protects against network eavesdroppers
 │ ┌──────────────────────────────────┐ │
-│ │ Mailbox-layer crypto (NaCl box)  │ │  ← wraps blob for the queue (sender ↔ recipient)
+│ │ Mailbox-layer crypto (NaCl box)  │ │  ← wraps blob for queue (sender ↔ queue owner)
 │ │ ┌──────────────────────────────┐ │ │
-│ │ │ Application-layer (Double R.) │ │ │  ← end-to-end encrypted message content
+│ │ │ Application-layer (MLS)      │ │ │  ← end-to-end encrypted, all recipient devices
 │ │ └──────────────────────────────┘ │ │
 │ └──────────────────────────────────┘ │
 └──────────────────────────────────────┘
 ```
 
-The mailbox-layer crypto is independent of identity and rotates per-queue. The application-layer crypto rotates per-message via the Double Ratchet.
+- **Transport** encrypts the wire between client and mailbox server.
+- **Mailbox-layer crypto** wraps the blob for the queue. Independent of user identity; rotates per-queue.
+- **Application-layer** uses MLS for both 1:1 (treated as 2-user, multi-device group) and groups. All recipient devices share the MLS epoch state and decrypt the same ciphertext.
+
+This unifies 1:1 and group encryption under a single standardized protocol (MLS RFC 9420). The legacy distinction between Double Ratchet (1:1) and group ratchets (Megolm-style) is collapsed into one model.
 
 ## Server scalability
 

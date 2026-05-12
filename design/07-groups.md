@@ -1,5 +1,7 @@
 # Group chats with MLS
 
+> Note: LibertyChat uses MLS for **all** conversations, including 1:1. A 1:1 chat is a 2-user MLS group with all participating devices as members. This document focuses on the explicit group case but the same mechanics apply to 1:1.
+
 ## Why MLS
 
 Most messengers built groups using ad-hoc protocols extended from one-to-one designs:
