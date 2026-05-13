@@ -214,8 +214,9 @@ Adding a new device later (Alice buys a tablet):
 
 - The new device publishes a KeyPackage.
 - Any of Alice's existing devices (which is a current group member) issues an Add proposal + Commit + Welcome targeted at the new device.
-- The new device joins the group at the current epoch — it can decrypt all future messages but no past messages (intentional: limits damage if a new device is compromised at provision time).
-- Past message history can optionally be **re-encrypted and forwarded** from an existing device to the new device via a separate (also MLS-protected) device-pairing channel.
+- **Full historical message transcripts are mandatory** — an existing device re-encrypts the conversation history to the new device via a dedicated device-pairing channel (itself an MLS group between Alice's devices). The new device is not considered "joined" until this transfer completes.
+- Rationale: LibertyChat enforces **thread integrity as a structural invariant**. A member cannot hold a reply without also holding its parent. Allowing a new device to start "from now on only" would create reply chains pointing at unknown ancestors, breaking the invariant.
+- Trade-off: the blast radius of a compromised newly-provisioned device is larger (it gets historical content too). This is accepted in exchange for uniform conversation state across all of a user's devices.
 
 Removing a device (Alice loses her phone):
 

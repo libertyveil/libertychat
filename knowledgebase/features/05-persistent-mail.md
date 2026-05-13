@@ -1,263 +1,318 @@
 # Feature 5: Persistent Mail Layer
 
-Step-by-step walkthrough of LibertyChat's persistent mail layer — long-form, threaded, attachment-friendly messages alongside ephemeral chat, in the same application and the same cryptographic stack.
+Step-by-step walkthrough of LibertyChat's unified message model. Mail and chat are not two separate features — they are two UI presentations of one single message type, with full cryptographic uniformity at the protocol layer.
+
+This document supersedes earlier drafts that treated mail and chat as distinct subsystems.
 
 ---
 
-## Step 1: The problem — messenger and mail are two disconnected worlds today
+## Step 1: The problem — chat and mail are two disconnected worlds today
 
-Users currently juggle two unrelated tools with very different properties:
+Users juggle two unrelated tools with very different properties.
 
 ### Messenger (Signal, WhatsApp, Matrix, SimpleX)
 
-- **Ephemeral by design.** Messages are short, chat-style, often relevant only for seconds to hours.
-- **No subject.** No threading structure. The user scrolls through a stream.
-- **No "archive"** as a filing system. Search UX is rudimentary.
-- **Multi-device sync for long history is limited.** Signal stores messages only locally; lost phone means lost history.
-- **Attachments often capped** (Signal 100 MB, WhatsApp 2 GB, Matrix homeserver-dependent).
+- Ephemeral by design.
+- No subject. No threading. Just a stream.
+- No archival, no search across years.
+- Attachments capped.
+- Multi-device sync for long history is limited.
 
 ### E-mail (Gmail, Outlook, ProtonMail)
 
-- **Persistent** with decades-long retention.
-- **Subject, threading, and headers** as first-class citizens.
-- **Attachments of essentially any size** (with provider limits).
-- **Plaintext on the server** (except for ProtonMail's closed bubbles), full plaintext indexing by the provider.
-- **Plaintext fallback** when attempting PGP — a recipient without a key receives the message unprotected.
-- **Metadata massively leaked** — From/To/Subject/Date are never encrypted because SMTP routing requires them.
+- Persistent, multi-year retention.
+- Subject, threading, headers as first-class citizens.
+- Attachments mostly unlimited (with provider quotas).
+- Plaintext on servers (except provider-bound bubbles).
+- **Plaintext fallback** when PGP-style encryption fails on a recipient → security collapses to the weakest link.
+- Massive metadata leakage — `From`/`To`/`Subject`/`Date` never encrypted because SMTP routing requires them.
+- Decades of retrofit hacks (SPF, DKIM, DMARC, MTA-STS, S/MIME, Autocrypt) trying to layer authentication onto a base protocol that never had it.
 
 ### What people actually need
 
-A scale from **short and ephemeral** to **long and persistent**:
+Real conversations sit on a spectrum from short and ephemeral to long and persistent:
 
 ```
-"ok"                                  → chat
-"on my way down"                      → chat
-"here's the address"                  → chat / short with attachment
-"summary of today's meeting"          → mail-style: subject, thread, longer text
-"contract negotiation thread"         → mail: persistent, searchable, attachments
-"annual tax correspondence with the lawyer" → mail: multi-year retention
+"ok"                                            → chat
+"on my way down"                                → chat
+"here's the address"                            → chat + attachment
+"summary of today's meeting"                    → mail-style: subject, thread
+"contract negotiation thread"                   → mail: persistent, searchable
+"annual tax correspondence with the lawyer"     → mail: multi-year retention
 ```
 
-Today users switch apps based on content. The conversation fractures: Signal chat "hey, did you read the contract?" → Gmail mail with the contract → back to Signal "and?". Three privacy domains, three auth models, three search indexes, no end-to-end encryption across them.
+Today users switch apps based on content. Conversations fracture across providers, each with its own crypto, its own identity model, its own search index. The same person is reached in two apps with two cryptographic identities.
 
 ### Nobody offers
 
-An application that uses **the same identity, the same crypto stack, the same multi-device model** for the full scale — from "ok" to a years-long mail thread.
+A system that uses **the same identity, the same crypto, the same conversation, the same multi-device model** for the full spectrum — from "ok" to a years-long thread with attachments.
 
-- **Signal / WhatsApp**: chat only, no mail concept.
-- **Matrix**: rooms only, no mail model.
-- **Delta Chat**: uses **actual SMTP/IMAP infrastructure** — inheriting every email privacy problem. Server sees headers, subject, routing metadata. Recipients without Autocrypt setup get plaintext.
-- **ProtonMail**: mail-only, closed bubble, no realtime chat.
-
-**LibertyChat closes this gap**: mail as a native second mode on the same stack, with the same privacy guarantees as chat.
+LibertyChat closes this gap by treating mail and chat as the **same operation**, distinguished only by the user's choice to attach a subject.
 
 ---
 
-## Step 2: How LibertyChat solves it — mail as a second mode on the same stack
+## Step 2: Foundational principles
 
-Mail is **not a separate protocol** — it is a different usage form of the same stack.
+Two architectural principles drive every decision in this layer:
 
-### Two modes on one foundation
+### Principle 1 — Uniform maximum cryptography
 
-```
-                Application Layer
-   ┌─────────────────────────┬─────────────────────────┐
-   │      Chat mode          │      Mail mode          │
-   │  - short messages       │  - subject + body       │
-   │  - no subject           │  - threading tree       │
-   │  - linear stream        │  - folders / labels     │
-   │  - ephemeral-friendly   │  - persistent default   │
-   │  - read markers         │  - read/unread + flags  │
-   └────────────┬────────────┴────────────┬────────────┘
-                │                         │
-                └────────┬────────────────┘
-                         ▼
-              ┌────────────────────────┐
-              │   MLS conversation     │  ← identical for both
-              │   (RFC 9420)           │
-              └────────────┬───────────┘
-                           ▼
-              ┌────────────────────────┐
-              │  Mailbox queue         │  ← identical for both
-              │  Encrypted blobs       │
-              └────────────────────────┘
-```
+Every message — a one-character chat ping, a multi-paragraph mail, a binary attachment chunk — flows through the **identical** cryptographic path:
 
-**Both modes use the same primitives**:
+- Hybrid PQ (X25519 + ML-KEM-768, Ed25519 + ML-DSA-65)
+- MLS framing (RFC 9420) with Forward Secrecy + Post-Compromise Security
+- Sealed Sender
+- Fixed-bucket padding (1 / 4 / 16 / 64 / 256 KiB)
+- VRF-rotated queue IDs
+- Hardware-backed local storage where available
 
-- The same MLS group for the relationship with a contact (or group).
-- The same mailbox queue for asynchronous delivery.
-- The same identity keys, the same sealed-sender encryption.
-- The same multi-device members (every device receives both chat and mail).
+There is **no "chat mode" with lighter crypto**. A short chat message can be more sensitive than a long mail. The system cannot guess content importance, so it always treats every message at the maximum protection level.
 
-The only difference is the **application-layer structure** of the message.
+### Principle 2 — Standards-native crypto, no retrofit hacks
 
-### Concretely: what distinguishes a mail from a chat message
+LibertyChat refuses the email-evolution pattern: a flawed insecure base covered in decades of bolt-on authentication and encryption attempts. The rule is that every layer is cryptographically authenticated and encrypted **by design from the first byte**.
 
-A chat message:
+Concrete consequences:
+
+- **No SMTP/IMAP bridge** to legacy email — not as a feature, not as an option, not in the future. Bridging would inherit every email weakness.
+- **No optional encryption**. Encryption is non-negotiable; no plaintext fallback ever.
+- **No "trust this IP/domain" assumption**. Authentication is always via signed cryptographic identity.
+- **No silent downgrade** on negotiation failure. If the maximum crypto path cannot be established, the operation fails openly.
+- **No external policy layer** to fix protocol problems. The protocol itself enforces correctness.
+
+Where classical email needs SPF, DKIM, DMARC, MTA-STS, S/MIME, etc. to retroactively secure SMTP, LibertyChat has none of these — because identity, integrity, and transport security are intrinsic to the protocol, not bolted on.
+
+---
+
+## Step 3: One message — the unified data model
+
+There is no `ChatMessage` and no `MailMessage`. There is **one** structure:
 
 ```rust
-ChatMessage {
-    sender_device: LeafIndex,
+struct Message {
+    message_id: MessageId,             // BLAKE3(sender_pubkey || timestamp || body || in_reply_to)
+    sender_device: LeafIndex,          // sender's MLS leaf in the conversation group
     timestamp: u64,
-    body: String,            // typically 1-3 sentences
-    reply_to: Option<MessageId>,
-    attachments: Vec<XftpRef>,   // rare
+    subject: Option<String>,           // optional, immutable once sent
+    in_reply_to: Option<MessageId>,    // optional, points to direct parent
+    body: MessageBody,                 // content or tombstone marker
+    attachments: Vec<XftpRef>,         // references to chunked encrypted file blobs
+}
+
+enum MessageBody {
+    Content(RichText),                 // normal payload
+    Tombstoned {                       // deletion placeholder (Step 6)
+        tombstoned_at: u64,
+        tombstoned_by: LeafIndex,      // must equal original sender's device
+    },
 }
 ```
 
-A mail message:
+That is the entire wire-level vocabulary. There is no `Topic` struct, no `topic_id`, no `references` list, no `thread_id`, no mode flag.
 
-```rust
-MailMessage {
-    sender_device: LeafIndex,
-    timestamp: u64,
-    subject: String,             // ← new
-    body: RichText,              // Markdown / longer text
-    thread_id: ThreadId,         // ← new, identifies the thread
-    in_reply_to: Option<MessageId>,
-    references: Vec<MessageId>,  // ← thread-tree parents
-    attachments: Vec<XftpRef>,   // expected, large files fine
-    flags: MailFlags,            // Read/Unread, Star, Important, Archived
-    labels: Vec<Label>,          // ← user-defined labels
-    retention_policy: Retention, // permanent / N-days / N-years
+### How the structure produces both chat and mail behavior
+
+| Case                              | `subject`            | `in_reply_to`        | UI presentation                        |
+|-----------------------------------|----------------------|----------------------|----------------------------------------|
+| Quick chat message                | `None`               | `None`               | Stream view, free-floating             |
+| Reply to a chat message           | `None`               | `Some(parent_id)`    | Stream view, displayed as a reply      |
+| New mail / start of a thread      | `Some("Vertrag Q3")` | `None`               | Inbox entry, thread root               |
+| Reply within a thread             | `None`               | `Some(parent_id)`    | Inside the thread tree                 |
+| Sub-thread spawned from a chat    | `Some("Steuer")`     | `Some(chat_msg_id)`  | New inbox entry, lineage retained      |
+
+### Subject inheritance
+
+When the client needs the "effective subject" of a message (for display, search, threading), it walks the in_reply_to chain upward until it finds a message with a subject, or until the chain ends:
+
+```
+fn effective_subject(msg) -> Option<String> {
+    if msg.subject.is_some() { return msg.subject.clone(); }
+    match msg.in_reply_to {
+        None         => None,
+        Some(parent) => effective_subject(parent),
+    }
 }
 ```
 
-Both are encrypted as **MLS Application Messages** — same AEAD path, same Forward-Secrecy ratchet. The mailbox server sees an encrypted blob in either case; it does not know the mode.
+A thread's identity is implicitly the `message_id` of the highest ancestor with a subject. There is no separate identifier.
 
-### How the UI decides which mode
+### Message-ID is content-hashed
 
-When composing a new message, the app decides based on:
+`message_id = BLAKE3(sender_pubkey || timestamp || body || in_reply_to)`.
 
-- **Explicit user choice** ("new mail" vs. "quick message")
-- **Content heuristic** (longer than N characters + contains paragraphs → suggest mail mode)
-- **Recipient preference** (some contacts are tagged mail-only, some chat-only, some both)
-
-The receiving app **automatically routes** based on the presence of `subject` — the message lands in the mail inbox or the chat stream. Both arrive over the same MLS group.
-
-### What this means in practice
-
-The user has **a single relationship** with Bob (one MLS group containing all devices on both sides). Inside that relationship flow:
-
-- Short chat ("on my way")
-- Longer mails with subject ("summary of today's meeting")
-- Attachments of unlimited size via XFTP
-- File drops
-- Audio/video call signaling
-
-**One conversation, every communication form.** No app switch, no identity switch, no encryption-domain switch.
-
-### Server side
-
-On the mailbox server there is no difference between chat and mail — both are blobs in the same queue. The only differences:
-
-- **Retention policy per blob** (chat: 7 days default; mail: permanent default).
-- **Storage quota for mail blobs counted separately** — a user may want 50 GB of mail archive but only 1 GB of chat backlog.
-
-Both policies live in the encrypted metadata the server needs for storage accounting (but cannot decrypt for content).
+This means a sender claiming `in_reply_to = X` must know `X`'s content to produce a valid `X` reference — the message-id is collision-resistant on content. Combined with sender signing (covered by MLS framing), the threading graph is **cryptographically authenticated** end to end. An attacker cannot fabricate or inject replies into a thread without legitimately participating in it.
 
 ---
 
-## Step 3: Threading model — how LibertyChat structures mail threads
+## Step 4: Thread integrity as a structural invariant
 
-Email threading is classically a mess: every client interprets `In-Reply-To` and `References` headers differently. Some flat (Gmail), some tree-structured (mutt, Thunderbird), some subject-based (Outlook).
+A reply cannot exist without its parent. This is a hard rule, not a best-effort behavior.
 
-LibertyChat implements **strictly tree-structured threading** with cryptographically verifiable parent relationships.
+### Consequences for sync and delivery
 
-### How a thread is built
+- **Mailbox queue** is acked per message. A receiver does not consider a message "consumed" until it is decrypted and stored locally. Lost messages are re-requested.
+- **Out-of-order delivery** is tolerated transiently — the client buffers and applies messages in causal order using `in_reply_to` and timestamp.
+- **New device joining a conversation** receives full historical message transcripts via the device-pairing channel before being considered active. There is no "from now on only" join — that would produce orphan replies (see [Feature 1, Step 10](01-unified-mls.md)).
 
-Every mail message has a unique `MessageId`. When Bob replies to Alice's mail:
+### Consequences for deletion
 
-```rust
-Alice's mail:
-  message_id:   "msg_abc123"
-  thread_id:    "msg_abc123"        // = own ID for thread roots
-  in_reply_to:  None
-  references:   []
+Two distinct operations exist:
 
-Bob's reply:
-  message_id:   "msg_def456"
-  thread_id:    "msg_abc123"        // ← thread root
-  in_reply_to:  "msg_abc123"        // ← direct parent
-  references:   ["msg_abc123"]      // ← ancestors
+#### 4.1 Destructive delete (tombstone)
 
-Carol's reply to Bob:
-  message_id:   "msg_ghi789"
-  thread_id:    "msg_abc123"        // ← same thread root
-  in_reply_to:  "msg_def456"        // ← Bob's mail
-  references:   ["msg_abc123", "msg_def456"]  // ← full ancestor chain
-```
+- **Granularity**: a single message — never a whole thread at once.
+- **Who is allowed**: only the original sender of that specific message.
+- **Mechanism**: the sender's device issues a signed delete request inside the MLS group; participating clients replace the message body with a `Tombstoned` marker.
+- **What is preserved**: `message_id`, `subject` (if any), `in_reply_to`, timestamp, sender identity. The structure of the thread is intact; only the content is gone.
+- **What is removed**: `body` content (text + attachment references). The attachment chunks on XFTP servers become unreferenced and are eventually garbage-collected by their retention policy.
+- **No cascade**: deleting a parent does **not** delete its children. Other participants' replies remain — nobody can delete content they did not author, directly or indirectly.
 
-The result is a **DAG** (directed acyclic graph) — in practice almost always a tree.
+#### 4.2 Local hide / archive
 
-### What this structure enables
+- **Granularity**: a whole thread, or individual messages, by client choice.
+- **Who is allowed**: any participant, on their own devices, for themselves.
+- **Mechanism**: per-user CRDT state (see Feature 16) marks the thread or message as hidden.
+- **What is changed globally**: nothing. Other participants are unaffected.
+- **Reversible**: hidden threads can be unhidden, found via search, etc.
 
-**1. Correct thread reconstruction**
+#### Why no global thread-delete
 
-Even if mails arrive out of order (Bob's reply arrives before Alice's original because Carol's mailbox server was faster), the client can correctly reassemble the tree. The `references` list provides full ancestor information.
+Nobody can delete the content of others. A "delete thread for everyone" operation would let one participant erase the contributions of all others. Even with consent from all participants, this would weaken the invariant that authored content is owned by its author.
 
-**2. Fork detection**
-
-If two people reply in parallel to the same mail, a fork is created:
-
-```
-        Alice's mail
-       /            \
-   Bob's reply    Carol's reply  ← fork
-       |
-   Dave's reply
-```
-
-The UI can show this **as a tree** instead of linearly. Gmail collapses everything into a list; LibertyChat shows the real structure (with a toggle).
-
-**3. Cryptographic continuity**
-
-Every `message_id` is a hash over (content + sender identity pubkey + timestamp + parent IDs). A recipient can verify:
-
-- "This mail claims to be a reply to `msg_abc123`."
-- "It is signed by Bob's device."
-- "Bob's device received `msg_abc123` and was able to reference it as a parent."
-
-An attacker cannot inject forged replies into a thread (they do not know the content of the parent mails, cannot compute the hash).
-
-### Thread-ID persistence through re-encryption
-
-MLS rotates epoch secrets, but the `thread_id` is an **application-layer** ID that stays stable across epoch transitions. Even after 50 member add/remove operations and corresponding epoch transitions, the thread remains coherent for the user.
-
-### Subject mutation in threads
-
-Classical mail problem: the subject changes over the course of a thread ("Re:" prefixes, someone changes the subject mid-thread, Outlook appends subject suffixes). Threading via subject string is therefore fragile.
-
-LibertyChat ignores the subject for threading entirely. The subject is **purely display-relevant**. Threading is based only on `thread_id` and `in_reply_to`/`references`. A user can change the subject mid-thread; the thread stays coherent.
-
-UI convention: the **first subject** is displayed as the thread title; later subject changes are marked inline ("subject changed: …"). Optionally a user can set a "personal title" override per thread, valid only locally (CRDT-synced across their own devices, see Feature 16).
-
-### Cross-thread searchability
-
-Threads are searchable because:
-
-- Subject strings are indexed client-side (or server-side via SSE, see Feature 18).
-- Body full-text analogously.
-- Thread boundaries are visible in search results — hits can be displayed as "thread with 8 mails, match in mail 3".
-
-### Multi-device consistency
-
-When Alice reads the same mail on phone and laptop, the read marker should be synchronous on both. The Read/Unread/Star/Archive flag is:
-
-- **Not written into the mail itself** (would violate MLS Forward Secrecy, since the server cannot cleanly map a mutation onto an encrypted blob).
-- **Instead held in a separate CRDT state** (see Feature 16) that syncs between Alice's own devices.
-- Bob's devices do **not** see Alice's read status (privacy: Bob should not know whether Alice has read the mail — the user can separately opt into read receipts).
-
-### Why this is superior
-
-- **Gmail**: server-side threading based on subject + sender clustering. Works often, fails on mid-thread subject changes. Server knows the threading structure in plaintext.
-- **Outlook**: conversation view based on `In-Reply-To` + subject. Rarely displays forks correctly. Plaintext threads.
-- **mutt / Thunderbird**: correct tree threading, but unencrypted headers.
-- **ProtonMail**: conversation view with subject matching; server does not see subject plaintext, but routing headers yes.
-- **Matrix reply threading**: technically a DAG, but UI typically flat. No cryptographic hash verification of the parent relationship.
-- **LibertyChat**: tree threading with **cryptographically authenticated parent relationships**, subject-independent, with multi-device CRDT sync for flags. The server sees neither subject nor threading structure — both are inside the encrypted application payload.
+If a user wants a thread to disappear from their own view, that is a local hide. If a user wants to remove their own contributions from a thread, that is N individual tombstones — one per message they sent.
 
 ---
 
-Walkthrough continues with further steps as the design discussion progresses.
+## Step 5: UI presentations — stream view vs inbox view
+
+Two UI views render the same underlying message store, differently:
+
+### Stream view (chat presentation)
+
+- Chronological list of every message in the conversation
+- Messages with a subject are visually highlighted as "thread starters" inline
+- Reply chains are shown via indentation or quote-blocks
+- Typing indicators, read receipts, reactions, message editing windows are enabled by default
+- Notification urgency is high (per-message, immediate)
+- Default retention is short (configurable per conversation; the user's preference)
+
+### Inbox view (mail presentation)
+
+- Lists only messages where `effective_subject != None` → only thread roots and threads they head
+- Each entry shows: subject, latest activity, reply count, participant set
+- Drill-in shows the thread as a tree (parent-child structure)
+- Typing indicators and reactions are disabled by default
+- Notification urgency is lower (batched, less aggressive)
+- Default retention is long
+
+Both views read from the same data. A user can switch freely. A message authored without a subject lives only in the stream view; a message with a subject appears in both.
+
+### UI defaults are user-overridable per thread
+
+Every UI default is **a default**, not a constraint. A user can:
+
+- Pin a chat-style conversation to permanent retention.
+- Enable typing indicators on a specific mail thread.
+- Turn off read receipts for a specific contact.
+
+The UI behavior never affects cryptographic protection — both views, all settings, route through the same maximum crypto stack.
+
+---
+
+## Step 6: Per-user state lives in CRDT, not in messages
+
+State that is **about the user's relationship to a message** (rather than about the message itself) lives in a per-user-device CRDT (see Feature 16):
+
+- Read / unread cursor per thread
+- Starred / important flags
+- Archived flag
+- User-defined labels
+- Personal title override for a thread (local renaming without changing the original subject)
+- Retention override (per thread or per message)
+
+This state syncs between the user's own devices via the device-pairing channel. Other participants in the conversation see none of it.
+
+Why this matters: it means the message itself is immutable on the wire (signed and committed in MLS), while user-perception state can evolve freely. There is no "everyone sees Alice marked this read" leakage; her read cursor is hers.
+
+---
+
+## Step 7: Attachments via XFTP
+
+Mail-style attachments (potentially large, potentially many) integrate uniformly:
+
+- Files are split into 64 MiB chunks.
+- Each chunk encrypted independently with a chunk key derived from a master file key.
+- Chunks uploaded to one or more XFTP servers (independent from mailbox servers).
+- The XFTP server sees only opaque encrypted chunks with random IDs; no filename, no link between chunks, no relation to senders or recipients.
+- An `XftpRef` (master key + chunk list with server endpoints + chunk IDs) is embedded in the `Message`, inside the MLS-encrypted payload.
+
+Consequences:
+
+- **No effective size limit** — only XFTP-server quotas (user-configurable).
+- **Multi-server distribution** — chunks of one file can be spread across several XFTP servers; no single server has a full view even of the encrypted form.
+- **Streaming decryption** — clients can fetch chunks lazily for video playback or partial reads.
+- **Resumable transfers** — interrupted uploads/downloads resume from the last successfully transferred chunk.
+
+When a message is tombstoned, its `XftpRef` is removed; the chunks become unreferenced and are GC'd by the XFTP retention policy.
+
+---
+
+## Step 8: What the server sees
+
+The mailbox server holds encrypted blobs in a queue. It does not see:
+
+- `subject`
+- `in_reply_to` / threading structure
+- `body` content
+- Attachment filenames, sizes (only padded buckets), MIME types
+- Whether a message is a chat or a thread
+- Whether a message is a tombstone
+- The conversation graph between users
+
+It does see:
+
+- That an encrypted blob of bucket size N was uploaded
+- That a recipient device (by ephemeral queue identity) ack'd it
+- Aggregate storage and bandwidth usage per queue
+
+The XFTP server analogously sees only:
+
+- Opaque chunk uploads
+- Opaque chunk downloads
+- Storage usage per pseudonym
+
+Identity, content, structure, threading — all of this is inside the MLS application payload and the XFTP chunk encryption layer.
+
+---
+
+## Step 9: What LibertyChat deliberately does not have
+
+Some features common in classical email or some messengers are absent **by design**, not by accident.
+
+| Feature                                | Why absent in LibertyChat                                                                                       |
+|----------------------------------------|-----------------------------------------------------------------------------------------------------------------|
+| SMTP / IMAP bridge to legacy email     | Bridging inherits every email privacy and authentication weakness. Hard boundary.                              |
+| Subject mutation / thread rename       | Subject is immutable. Local title override is a per-user CRDT (Step 6).                                         |
+| `References` ancestor chain in message | Redundant. Walking `in_reply_to` is sufficient; thread integrity is enforced structurally (Step 4).             |
+| CC / BCC                                | MLS group membership is the authoritative recipient list. To include extras, add them to the group.            |
+| Hidden recipients (BCC-equivalent)     | Incompatible with MLS group transparency. A user wanting a private copy uses a separate 1:1 conversation.       |
+| Read-receipts on by default            | Privacy default: do not leak whether the recipient has read a message. Per-thread opt-in available.            |
+| Global thread-delete                   | One participant cannot erase others' authored content. Tombstoning is sender-only and per-message (Step 4.1).   |
+| Subject-based thread auto-merge        | Classical email behavior is fragile and a frequent source of misthreading. Threads are joined by `in_reply_to` only. |
+| Plaintext fallback                     | If the hybrid PQ + MLS path cannot be established, the operation fails openly. No degraded modes.              |
+
+---
+
+## Step 10: Why this is superior
+
+- **Signal / WhatsApp**: chat only. No subject, no threading, no mail-style longform layer. Their model cannot represent multi-week formal correspondence in the same conversation as quick chats.
+- **iMessage**: same — one continuous stream per contact, no thread concept.
+- **Matrix**: rooms are persistent, but threading is a relatively recent addition and not deeply integrated. No mail-style longform UX.
+- **Delta Chat**: uses real SMTP/IMAP under the hood — inherits every email privacy problem, requires Autocrypt for any encryption, plaintext fallback to non-Autocrypt recipients.
+- **ProtonMail**: mail only, no realtime chat, closed end-to-end bubble (only encrypted between ProtonMail users).
+- **Gmail / Outlook**: plaintext on the server, full metadata leakage, decades of retrofit hacks.
+- **LibertyChat**: one message model, one cryptographic stack at maximum strength, one identity, one conversation. Chat and mail are two views over the same data. Thread integrity is a structural invariant. The server holds nothing usable. No retrofit hacks because every layer is authenticated and encrypted from the first byte.
+
+---
+
+This is the unified model. Mail is not a separate subsystem; it is a UI presentation of messages that have a subject. Chat is the UI presentation of messages that do not. The underlying protocol, crypto, identity, and storage are identical for both.
