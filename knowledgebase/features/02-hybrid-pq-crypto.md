@@ -205,4 +205,205 @@ File master key is exchanged through the MLS channel → inherits hybrid PQ auto
 
 ---
 
+## Step 6: Performance and size consequences in practice
+
+Hybrid PQ costs bandwidth, storage, and CPU in exchange for quantum resistance. Concrete numbers:
+
+### Size comparison per operation
+
+| Operation | Classical (X25519/Ed25519) | Hybrid (+ML-KEM/ML-DSA) | Factor |
+|---|---|---|---|
+| Public key | 32 B | 1,216 B | ~38× |
+| KEM ciphertext | 32 B | 1,120 B | ~35× |
+| Signature | 64 B | 3,373 B | ~52× |
+| Identity bundle (4 keys + 2 sigs) | ~200 B | ~5,500 B | ~28× |
+| Complete KeyPackage | ~250 B | ~6 KB | ~24× |
+| MLS Welcome (10-member group) | ~2 KB | ~25 KB | ~12× |
+| MLS Commit (10-member group) | ~1 KB | ~15 KB | ~15× |
+
+### CPU comparison (order of magnitude)
+
+On a current smartphone SoC (Apple A17 / Snapdragon 8 Gen 3):
+
+| Operation | Classical | Hybrid | Factor |
+|---|---|---|---|
+| KEM encapsulation | ~50 µs | ~80 µs (X25519 + ML-KEM-768) | 1.6× |
+| KEM decapsulation | ~50 µs | ~70 µs | 1.4× |
+| Sign | ~30 µs | ~250 µs | ~8× |
+| Verify | ~80 µs | ~150 µs | ~2× |
+
+Generating a hybrid signature costs ~250 µs instead of 30 µs. At one message per second, unnoticeable. In a 1000-member group with a massive Commit burst (every member signs a Welcome confirmation), it becomes relevant — still in the millisecond range.
+
+### Where it pinches
+
+- **Mobile push notifications with payload**: APNs/FCM cap payloads at 4 KB. A hybrid Welcome no longer fits as a complete push payload. Solution: push carries only a "you have mail" signal; the device fetches the Welcome from its mailbox queue.
+- **DNS TXT for KeyPackages**: DNS TXT records are limited to 255 characters per string and ~64 KB per record. A classical KeyPackage fits a single record; a hybrid KeyPackage needs multiple records or must be referenced via URL.
+- **QR code size for invite links**: a QR code embedding a hybrid public key grows (version 20+ instead of version 10). Still scannable, but denser.
+- **Battery**: negligible in normal use. No measurable difference in 24h background operation.
+
+### Where it does not pinch
+
+- General bandwidth: messenger traffic is minimal compared to images/video. A conversation with ~100 messages/day consumes ~600 KB hybrid overhead per day.
+- Storage: a KeyPackage pool on the mailbox server for 1,000 users with 10 KeyPackages each takes ~60 MB instead of ~2.5 MB. Trivial.
+
+### Why this is superior
+
+- **Conscious trade-offs**: every size consequence is explicitly accounted for and absorbed at a layer where it does not hurt (e.g. push payload becomes a signal-only push).
+- Messengers retrofitting PQ later have to make these trade-offs **after the fact**, often with compatibility workarounds. LibertyChat plans for hybrid sizes from the start.
+
+---
+
+## Step 7: Cipher agility — preparing for "what comes after ML-KEM and ML-DSA"
+
+Today's hybrid is X25519 + ML-KEM-768. But:
+
+- What if ML-KEM is broken in 5 years (the way SIKE suddenly fell)?
+- What if NIST standardizes a stronger PQ algorithm in 2030 (e.g. a code-based one as a backup to lattice-based ones)?
+- What if X25519 falls faster than expected?
+
+Answer: **cipher agility is built into the protocol itself**, not bolted on later.
+
+### What cipher agility concretely means
+
+Every message, every KeyPackage, every MLS Commit carries an explicit **ciphersuite identifier** in its header:
+
+```
+ciphersuite_id: u16  // e.g. 0xF031 = MLS_256_XWING_AES256GCM_SHA512_Ed25519+MLDSA65
+```
+
+On receipt the client checks:
+
+1. "Do I know this ciphersuite?" → yes, continue / no, reject with a clear error.
+2. "Are the contained algorithms still classified as secure?" → local allow-list.
+3. "Do I prefer a stronger suite?" → upgrade on re-keying.
+
+### Three mechanisms for smooth migration
+
+**1. Multi-cipher KeyPackages**
+
+A device can publish **several KeyPackages in parallel**, one per supported ciphersuite. Example:
+
+- KeyPackage A: `MLS_256_XWING_AES256GCM_SHA512_Ed25519+MLDSA65` (today's default)
+- KeyPackage B: `MLS_256_FUTURE_CIPHER_...` (as soon as available)
+
+The initiator picks the strongest suite both sides support.
+
+**2. In-group ciphersuite upgrade**
+
+MLS supports **Reinit Commits**: an existing group can atomically migrate to a new ciphersuite. All members swap their KeyPackages, the next Commit is in the new suite, old epoch secrets are either archived (for historical decryption) or deleted (for aggressive FS).
+
+**3. Algorithm sunset list**
+
+The LibertyChat core ships a signed, maintainer-updated list:
+
+```
+sunset_after = {
+    "Ed25519-only":        2030-01-01,
+    "ML-KEM-512":          2032-01-01,  # parameter too small
+    "SHA-256-only-hash":   2035-01-01,
+    ...
+}
+```
+
+Clients refuse operations using the relevant suite after the sunset date. Updates to this list ship as signed update packages (separate from code updates), so even older clients without a fresh app build are warned about deprecated suites.
+
+### Critical detail: defense against downgrade attacks
+
+Cipher agility is a security risk **if implemented wrong**. The classical pitfall (TLS had this for years): an attacker manipulates ciphersuite negotiation and forces both sides onto the weakest mutually supported suite.
+
+LibertyChat defense:
+
+- The ciphersuite selection is included in the **MLS transcript hash**.
+- Every Commit signs the entire negotiation history.
+- A downgrade attempt changes the hash → signature verification fails.
+
+### Why this is superior
+
+- **Signal**: ciphersuite is hard-coded per protocol version. PQXDH was a **separate protocol version** rolled out as a migration. No in-band upgrade possible.
+- **WhatsApp**: hard-coded; migrations are server-driven.
+- **Matrix**: has ciphersuite fields but they are barely used; migrations happen via client updates in practice.
+- **SimpleX**: hard-coded ciphersuite per protocol major version.
+- **LibertyChat**: cipher agility is **structurally** anchored in the protocol, with downgrade defense, multi-suite KeyPackages, and automatic sunset enforcement. If ML-KEM falls in 5 years, the migration path is not "app update + re-pair all contacts" but "register a new suite, issue a Reinit Commit per group".
+
+---
+
+## Step 8: Key lifecycle and rotation
+
+Hybrid PQ means **four instead of two** identity keys per device. Each has its own lifecycle. Managed badly → security gap. LibertyChat defines this explicitly.
+
+### The four identity keys (per device)
+
+| Key | Algorithm | Purpose | Lifetime | Rotation trigger |
+|---|---|---|---|---|
+| Sign-classical | Ed25519 | Classical signatures | up to device lifetime | compromise or PCS trigger |
+| Sign-PQ | ML-DSA-65 | PQ signatures | up to device lifetime | compromise or PCS trigger |
+| Encrypt-classical | X25519 | Classical HPKE | same as sign-classical | rotated with sign-key |
+| Encrypt-PQ | ML-KEM-768 | PQ HPKE | same as sign-PQ | rotated with sign-key |
+
+Convention: all four rotate **together**. Rotating one alone breaks the hybrid model (you would have a fresh half and an aged half whose compromise is no longer protected by the fresh half).
+
+### KeyPackages — short-lived by design
+
+KeyPackages are **single-use** and short-lived. Lifecycle:
+
+1. **Generation**: device generates a batch of 50 KeyPackages at once (ephemeral HPKE keys + bundle signature with identity keys).
+2. **Publish**: all 50 uploaded to the mailbox server.
+3. **Consumption**: each invitation consumes exactly one (server deletes it on delivery).
+4. **Refill**: as soon as the batch drops below 10, the device automatically generates a new batch.
+5. **Expiry**: every KeyPackage carries a hard expiration date (e.g. 30 days). After that no client will accept an "old" KeyPackage even if it is still in the server pool.
+
+The expiration date matters: without it, an attacker who eventually compromises the ephemeral HPKE private key gains **retroactive access** to all Welcome messages generated under that KeyPackage.
+
+### Identity key rotation — scheduled and unscheduled
+
+**Scheduled rotation (PCS for identity)**: every 12 months the device generates fresh identity keys, signs the new with the old (continuity chain), publishes a rotation statement. Every group the device is a member of receives the new identity key via an MLS Update Commit.
+
+```
+Continuity statement:
+{
+  old_pubkey_classical: ...,
+  old_pubkey_pq: ...,
+  new_pubkey_classical: ...,
+  new_pubkey_pq: ...,
+  rotation_timestamp: ...,
+  signature_old_classical: ...,  // by old Ed25519
+  signature_old_pq: ...,         // by old ML-DSA
+  signature_new_classical: ...,  // by new Ed25519 (self-sign)
+  signature_new_pq: ...,         // by new ML-DSA (self-sign)
+}
+```
+
+Every counterparty can independently verify: "yes, this new key belongs to the identity I have trusted for 3 years."
+
+**Unscheduled rotation (compromise)**: the device reports a compromise (or the user triggers manually). Immediately:
+
+1. Generate new identity keys.
+2. Invalidate all KeyPackages signed by the old keys (tombstone marker on the mailbox server).
+3. Issue Update Commits in **every** group the device is a member of.
+4. Publish new KeyPackages.
+5. **Optional**: revocation statement signed by the old key ("this key is compromised, do not trust it") — distributed to all known contacts.
+
+### Key material storage on the device
+
+Four levels of sensitivity:
+
+| Material | Stored where |
+|---|---|
+| Identity private keys (4) | **TEE / hardware keystore** (Secure Enclave, StrongBox, TPM) when available; otherwise OS keychain with passphrase |
+| Active MLS epoch secrets | encrypted in app database, deleted on app sleep |
+| KeyPackage HPKE private keys (for Welcome receipt) | app database, deleted on consumption |
+| Per-message ratchet keys | RAM only, deleted after decryption |
+
+Identity private keys never leave the device. Even at backup time only a **Shamir share** is exported (see Feature 12), never the full key.
+
+### Why this is superior
+
+- **Signal**: a single classical identity key, no defined rotation cycle. If your key is compromised you are effectively forced to create a new account (phone number reset).
+- **WhatsApp**: identity tied to phone number, "rotation" = SIM swap.
+- **Matrix**: cross-signing keys exist, but rotation has UX friction (re-verifying every contact).
+- **SimpleX**: no global identity keys, only per-contact keys. Compromise of one contact breaks only that link. Good for pseudonymity, bad for "verified long-lived identity".
+- **LibertyChat**: **structured 12-month rotation with a continuity chain**, atomic compromise response, hardware storage by default, all four hybrid keys managed together. No account swap needed at rotation; contacts verify automatically via the signature chain.
+
+---
+
 Walkthrough continues with further steps as the design discussion progresses.
