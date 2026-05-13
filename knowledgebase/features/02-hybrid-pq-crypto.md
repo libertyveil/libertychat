@@ -406,4 +406,137 @@ Identity private keys never leave the device. Even at backup time only a **Shami
 
 ---
 
+## Step 9: Trust anchors and verification of hybrid identity
+
+Crypto alone is not enough. The user must be certain that the **public key they are encrypting to** actually belongs to the intended recipient. Otherwise even the strongest end-to-end encryption is moot — a man-in-the-middle attacker inserts their own key, the user encrypts to them, they re-encrypt to the real recipient.
+
+With classical crypto this is already a problem. With hybrid it becomes more complex, because **two** keys must be verified.
+
+### The verification problem, concretely
+
+Alice adds Bob as a contact. She receives:
+
+- `Bob_Ed25519_pub` (classical identity)
+- `Bob_MLDSA_pub` (PQ identity)
+- Both sign KeyPackages and membership updates.
+
+Question: how does Alice know that both actually belong to Bob and not to a MitM?
+
+LibertyChat offers **four verification mechanisms** with ascending strength.
+
+### Mechanism 1: Safety Number (out-of-band, short form)
+
+A deterministically derivable **safety number** is computed from all hybrid pubkeys:
+
+```
+safety_number = BLAKE3(
+    "libertychat-safety-v1" ||
+    sort([Alice_Ed25519_pub, Alice_MLDSA_pub,
+          Bob_Ed25519_pub,   Bob_MLDSA_pub])
+)[:30]  // 30 bytes = 60 hex characters
+```
+
+Critical: **all four hybrid keys go in**, both sides symmetric. Both see an identical safety number.
+
+Displayed as twelve five-digit decimal groups (Signal-style):
+
+```
+12345 67890 23456 78901 34567 89012
+45678 90123 56789 01234 67890 12345
+```
+
+Alice and Bob compare via an **out-of-band channel** (phone call, in-person meeting, video call). If the numbers match, no MitM sits in between.
+
+### Mechanism 2: QR code (out-of-band, visual)
+
+In person, Bob shows his full identity block as a QR code:
+
+```
+QR payload:
+{
+  v: 1,
+  identity_classical: Bob_Ed25519_pub,
+  identity_pq: Bob_MLDSA_pub,
+  encrypt_classical: Bob_X25519_pub,
+  encrypt_pq: Bob_MLKEM_pub,
+  mailbox_endpoint: lvm://...,
+  display_name: "Bob",
+  signature_classical: ...,  // self-signed
+  signature_pq: ...
+}
+```
+
+Alice scans → her client verifies both self-signatures → identity is confirmed. Hybrid keys are validated together.
+
+QR code size: ~3 KB payload → QR version 25 (thumb-sized). Scannable with a standard phone camera in under 2 seconds.
+
+### Mechanism 3: TOFU with cryptographic continuity
+
+"Trust On First Use" — on first contact, Alice simply trusts the keys she received. Once Bob's keys are pinned, **every future key change** is verified via the continuity chain (see Step 8):
+
+```
+old_keys → signed → new_keys
+```
+
+If the signature is valid, the rotation is legitimate. If it is not (no valid transition), the client raises a **security alert**:
+
+```
+⚠ Bob's key has changed.
+   The new identity was NOT signed by the previous one.
+   Possibly a new device — or an attacker.
+   [Verify via QR / safety number]   [Block]
+```
+
+TOFU is weaker than out-of-band but practical for contacts you do not meet in person.
+
+### Mechanism 4: Web-of-trust via signed endorsements (optional)
+
+Alice can **endorse** Bob's identity by signing his identity bundle with her own keys:
+
+```
+Endorsement {
+  endorser: Alice_Ed25519_pub + Alice_MLDSA_pub,
+  endorsed: Bob_Ed25519_pub + Bob_MLDSA_pub,
+  endorsed_display_name: "Bob",
+  endorsement_timestamp: 2026-05-13,
+  endorsement_strength: "in_person_verified",  // or "video_call", "tofu"
+  signature_classical: ...,
+  signature_pq: ...
+}
+```
+
+Carol, who trusts Alice but does not yet know Bob, sees Alice's endorsement and can **transitively** build trust. An endorsement graph emerges (similar to GPG web-of-trust, but hybrid and with explicit strength markers).
+
+Strictly optional. Anyone who does not want a web-of-trust simply ignores it. Anyone who does gets additional trust without a central authority.
+
+### What happens on compromise
+
+When a key is compromised and the user rotates (unscheduled, see Step 8):
+
+- The continuity chain is broken, because the attacker had the old private keys and could sign a fake "new identity".
+- Therefore: a **revocation statement** is published in parallel with the rotation, signed by the old key:
+
+```
+Revocation {
+  revoked_keys: [old_Ed25519_pub, old_MLDSA_pub],
+  revocation_reason: "compromise_suspected",
+  revocation_timestamp: ...,
+  new_identity_anchor: <new_pubkeys>,
+  signatures: ...
+}
+```
+
+Once contacts have seen the revocation statement, they **no longer accept continuity statements** from the old key. Re-verification via QR/safety number is required.
+
+### Why this is superior
+
+- **Signal**: safety numbers cover only the classical identity (no hybrid coverage). No web-of-trust. Continuity verification exists but only over the single identity key.
+- **WhatsApp**: safety numbers present, but 99% of users never compare them. No web-of-trust.
+- **Matrix**: cross-signing with complex device verification UX, frequent source of user confusion. No hybrid verification.
+- **SimpleX**: SAS (short authentication string) for connection confirmation. No long-lived identity verification path, because no global identities exist.
+- **Jami**: TOFU with DHT; no structured web-of-trust.
+- **LibertyChat**: **four graduated verification mechanisms** with **hybrid coverage**, a clean continuity chain with compromise response, optional web-of-trust without a CA. The user picks strength by threat model — from "TOFU for family" to "in-person QR + endorsed by 3 trusted parties for activism".
+
+---
+
 Walkthrough continues with further steps as the design discussion progresses.
