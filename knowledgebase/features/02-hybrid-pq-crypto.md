@@ -539,4 +539,141 @@ Once contacts have seen the revocation statement, they **no longer accept contin
 
 ---
 
-Walkthrough continues with further steps as the design discussion progresses.
+## Step 10: Implementation and audit
+
+The best crypto design is worthless if the implementation is broken. For hybrid PQ there are additional risks: two algorithms in parallel mean a doubled implementation surface, a doubled side-channel attack surface, and new classes of bugs (e.g. a wrongly implemented combiner).
+
+LibertyChat strategy: **never reimplement what has already been vetted; always implement the workflow ourselves.**
+
+### Foundation libraries (not written by us)
+
+| Component | Library | Reason |
+|---|---|---|
+| MLS protocol | **mls-rs** (AWS) | Production-grade, deployed in AWS Wickr, external audit |
+| X25519, Ed25519 | **dalek-cryptography** (`x25519-dalek`, `ed25519-dalek`) | Industry standard in the Rust ecosystem, peer-reviewed |
+| ML-KEM-768 | **ml-kem** (RustCrypto WG) or **liboqs-rust** | RustCrypto variant: pure Rust, constant-time. liboqs: C bindings to NIST reference code |
+| ML-DSA-65 | **ml-dsa** (RustCrypto) or **liboqs-rust** | Same choice |
+| X-Wing combiner | **x-wing-rs** (in development, internal impl against IRTF draft) | Hybrid combiner per IRTF spec |
+| HPKE | **hpke-rs** | RFC 9180-compliant, compatible with MLS |
+| AEAD (ChaCha20-Poly1305 / AES-GCM) | **ring** or **RustCrypto** | both audited |
+| HKDF | **hkdf** crate | trivially correct |
+| BLAKE3 | **blake3** official crate | single vendor, but reference implementation |
+
+**Deliberate choice per algorithm**: pure Rust where available (`x25519-dalek`, RustCrypto ML-KEM impl); C bindings only where unavoidable (`liboqs` as fallback while pure-Rust PQ implementations mature).
+
+### What LibertyChat writes itself
+
+- **Protocol layer**: mailbox queue, KeyPackage management, sealed sender, VRF queue rotation, etc.
+- **Hybrid combiner wiring**: how KEM outputs flow into HKDF, how signatures are concatenated, how the ciphersuite ID is interpreted.
+- **Continuity chain and revocation logic.**
+- **Trust verification** (safety number, QR, TOFU pinning, WoT endorsements).
+- **Cipher-agility negotiation** and downgrade defense.
+
+### Test vectors
+
+Three categories:
+
+**1. NIST test vectors (mandatory)**
+
+ML-KEM and ML-DSA ship with official NIST CAVP test vectors. The LibertyChat test suite runs them 1:1 and verifies byte-identity. If a dependency update introduces a regression, it is rejected immediately.
+
+**2. MLS interop test vectors (from the IETF MLS WG)**
+
+The MLS Working Group maintains a corpus of test vectors (Welcome messages, Commits, schedule outputs). LibertyChat and mls-rs are checked against it.
+
+**3. LibertyChat hybrid test vectors (our own)**
+
+We publish vectors for our LibertyChat-specific constructions:
+
+- Hybrid combiner output for known inputs
+- Ciphersuite selection hash for a given transcript
+- Safety number computation for given identity bundles
+
+Any re-implementer (e.g. in another language) can verify byte compatibility against these.
+
+### Formal verification
+
+Before v1.0 the protocol is formally modeled. Two parallel approaches:
+
+**Tamarin Prover** (symbolic crypto, good for authentication properties)
+
+Models for:
+
+- Initial handshake with hybrid KEM
+- KeyPackage replay resistance
+- Compromise recovery (PCS properties)
+- Ciphersuite negotiation against downgrade attacks
+
+Expected output statements:
+
+- "If both sides complete the handshake, they hold identical shared secrets" (authentication)
+- "A passive attacker cannot compute the shared secret as long as either KEM is secure" (confidentiality under the hybrid assumption)
+- "An active attacker cannot force a downgrade to a weaker suite" (downgrade resistance)
+
+**ProVerif** (applied pi-calculus, good for equivalence properties)
+
+Models for:
+
+- Sealed-sender anonymity (server does not learn the sender)
+- Forward secrecy after an epoch transition
+- Post-compromise security after an Update Commit
+
+### External audits
+
+Pre-1.0 release gate:
+
+1. **Crypto audit** by Trail of Bits, Cure53, or NCC Group. Scope:
+   - Hybrid combiner implementation
+   - KeyPackage lifecycle including replay resistance
+   - Trust verification
+   - Side-channel analysis (timing, power-analysis surface)
+
+2. **Protocol audit** by an academic group (e.g. INRIA, NCC, or Real-World-Crypto Network). Scope:
+   - Tamarin/ProVerif model review
+   - Adversary model discussion
+   - PCS and FS property validation
+
+3. **Implementation fuzzing** as continuous integration:
+   - `cargo-fuzz` on every parser (Welcome messages, KeyPackages, continuity statements)
+   - libFuzzer with AFL++ as backend
+   - Coverage > 85% for parsers/serializers
+
+4. **Reproducible build verification**:
+   - The audit firm builds from source and compares the resulting binary against the release binary
+   - Nix or Bazel as the deterministic build system
+   - An audit attestation is published with the release
+
+### Bug bounty program
+
+Pre-1.0: a private bounty with ~10 invited researchers (Real-World-Crypto community).
+Post-1.0: a public bounty via HackerOne or managed directly. Reward tiers:
+
+| Severity | Reward |
+|---|---|
+| Crypto break (KEM / signature / combiner) | $50,000 |
+| Authentication bypass | $20,000 |
+| Metadata leak (sealed sender, queue linking) | $10,000 |
+| DoS against mailbox server | $2,000 |
+| Minor issues | $200–$1,000 |
+
+### Reference implementation strategy
+
+`libertychat-core` is **the** reference implementation. All clients (desktop, mobile, CLI) are thin UI layers on top of it. Consequences:
+
+- A core audit covers all clients.
+- A crypto bug is fixed everywhere immediately.
+- Native mobile bindings (Swift via UniFFI, Kotlin via JNI) reduce to pass-through.
+
+No re-implementations in JavaScript or C++; anyone building an alternative client calls `libertychat-core` via FFI.
+
+### Why this is superior
+
+- **Signal**: open source, external audits (NCC 2016, Trail of Bits periodically), but **no formal model** for the newer hybrid extensions. Reproducible builds only partial (iOS impossible due to App Store signing).
+- **WhatsApp**: closed source. Self-published whitepapers, no independent code audit possible.
+- **Matrix**: open source, individual audits of Element/Olm, **no central formal correctness proof** across the entire system. Reproducible builds not end-to-end.
+- **SimpleX**: open source, Trail of Bits audit in 2024, but **no formal model**. Build reproducibility unclear.
+- **LibertyChat**: **three-tier audit gate** (crypto + protocol + reproducible-build verification), **formal Tamarin and ProVerif models** as a release prerequisite, **bug bounty with explicit tiers**, **reference implementation as single source of truth**. No other open-source messenger has all four as a hard release gate.
+
+---
+
+**Feature 2 (Hybrid Post-Quantum from Day One) is complete.** Walkthrough continues with feature 3.
